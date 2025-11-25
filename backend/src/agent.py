@@ -1,14 +1,12 @@
 import logging
 import os
 import json
-import datetime
-from typing import Optional, List, Dict, Any
+from typing import List
+from pathlib import Path
 
 from dotenv import load_dotenv
-from livekit import rtc
 from livekit.agents import (
     Agent,
-    AgentServer,
     AgentSession,
     JobContext,
     JobProcess,
@@ -20,7 +18,6 @@ from livekit.agents import (
     cli,
     metrics,
     tokenize,
-    room_io,
     function_tool,
 )
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
@@ -30,221 +27,144 @@ logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
-# ----- FIXED: make the log path absolute at project root -----
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WELLNESS_LOG_PATH = os.path.join(BASE_DIR, "wellness_log.json")
-# -------------------------------------------------------------
+# Use absolute path for Windows
+COURSE_CONTENT_FILE = r"C:\Users\hp\ten-days-of-voice-agents-2025\shared_data\day4_tutor_content.json"
 
-def _read_wellness_log() -> List[Dict[str, Any]]:
-    """Internal helper: read JSON log, return list of entries."""
-    if not os.path.exists(WELLNESS_LOG_PATH):
-        return []
-
-    try:
-        with open(WELLNESS_LOG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return data
-        # If corrupted / wrong type, back it up and start fresh
-        backup_path = WELLNESS_LOG_PATH + ".backup"
-        with open(backup_path, "w", encoding="utf-8") as bf:
-            json.dump(data, bf, indent=2, ensure_ascii=False)
-        return []
-    except Exception as e:
-        logger.warning(f"Failed to read wellness log: {e}")
-        return []
-
-
-def _write_wellness_log(entries: List[Dict[str, Any]]) -> None:
-    """Internal helper: write list of entries back to JSON log."""
-    try:
-        with open(WELLNESS_LOG_PATH, "w", encoding="utf-8") as f:
-            json.dump(entries, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"Failed to write wellness log: {e}")
-
-
-class Assistant(Agent):
+class ActiveRecallCoach(Agent):
     def __init__(self) -> None:
         super().__init__(
             instructions="""
-You are a short, practical daily health & wellness check-in companion called "Nudge".
+You are an Active Recall Coach that helps users learn through teaching. You have three learning modes:
 
-Your job:
-- Have a brief, focused check-in with the user once per day (around 5–10 minutes).
-- Ask about mood, energy, and any current stressors.
-- Help them pick 1–3 realistic, concrete objectives for the day.
-- Offer simple, non-medical suggestions.
-- Summarize and confirm what you heard at the end.
+LEARNING MODES:
+1. LEARN MODE (Voice: "Matthew"): Explain concepts clearly and concisely using the course content.
+2. QUIZ MODE (Voice: "Alicia"): Ask questions to test understanding using sample questions.
+3. TEACH_BACK MODE (Voice: "Ken"): Ask users to explain concepts back and provide basic qualitative feedback.
 
-VERY IMPORTANT SAFETY RULES:
-- You are NOT a doctor, therapist, or crisis counselor.
-- Do NOT diagnose conditions, suggest medications, or interpret symptoms.
-- Do NOT give medical, psychiatric, or nutritional prescriptions.
-- If the user mentions self-harm, suicidal thoughts, or extreme distress:
-  - Acknowledge their feelings with warmth.
-  - Clearly say you are not a professional.
-  - Encourage them to immediately reach out to a trusted person or local emergency/mental health services.
-  - Keep your language supportive and non-judgmental.
+HOW TO RESPOND:
+- Always start by checking the current mode and available concepts
+- In LEARN mode: Use the concept summary to explain clearly
+- In QUIZ mode: Use the sample_question to test understanding  
+- In TEACH_BACK mode: Ask the user to explain the concept back to you
+- Always allow mode switching when requested
+- Be encouraging and educational
 
-TOOLS YOU CAN USE:
-1) `get_wellness_history(limit)`:
-   - Call once near the start of the conversation.
-   - It returns the most recent past check-ins (if any).
-   - Use this to make at least ONE small reference to past days, for example:
-     - "Last time you said your energy was low. How does today compare?"
-     - "You wanted to focus on sleep last time. Did that help at all?"
-
-2) `log_wellness_check(mood, energy, stressors, objectives, agent_summary)`:
-
-   - At the END of EVERY conversation, after you recap and the user confirms,
-     you MUST call this tool EXACTLY ONE TIME.
-
-   - This tool call is REQUIRED for every daily check-in. Never skip it.
-
-   - Fill the arguments as follows:
-       • mood: short text describing how the user said they feel
-       • energy: integer 1–10 (convert their answer to a number)
-       • stressors: short text or null
-       • objectives: 1–3 goals stated by the user
-       • agent_summary: 1–3 sentences summarizing the check-in
-
-   - After calling this tool, your job is done and you should not continue
-     the conversation.
-
-
-CONVERSATION FLOW (DEFAULT):
-
-1) Warm open:
-   - Greet briefly.
-   - If history exists (via `get_wellness_history`), reference it naturally.
-   - Example: "Hey, good to see you again. Last time you were pretty drained. How are you feeling today?"
-
-2) Mood and energy:
-   - Ask open-ended AND simple-scale questions, e.g.:
-     - "How are you feeling today overall?"
-     - "On a scale from 1 to 10, where is your energy right now?"
-     - "Anything stressing you out at the moment?"
-   - Reflect back in simple language: "Sounds like you're a bit anxious but still functioning."
-
-3) Intentions / objectives for today:
-   - Ask for 1–3 concrete things:
-     - "What are 1–3 things you’d like to get done today?"
-     - "Is there anything you want to do just for yourself? (rest, exercise, hobbies, calling someone, etc.)"
-   - If goals are vague, help make them smaller and more specific:
-     - “Instead of ‘study a lot’, maybe ‘do 2 focused 25-minute study blocks’.”
-
-4) Simple, realistic suggestions:
-   - Offer small, optional ideas. Keep it grounded:
-     - break big tasks into smaller steps
-     - short breaks
-     - 5–10 minute walk or stretch
-     - drink water, light snack
-   - Do NOT overcomplicate or push too hard; suggestions should feel doable TODAY.
-
-5) Recap and confirmation:
-   - Summarize in 2–4 sentences:
-     - How they are feeling (mood + energy)
-     - The 1–3 main objectives
-     - Any tiny self-care step you agreed on.
-   - Example:
-     - "So today you’re feeling a bit tired but motivated, energy around 6/10.
-        Your focus is: finish your report draft, go for a 10-minute walk,
-        and try to get to bed before midnight."
-   - Ask: "Does this sound right?" and briefly adjust if needed.
-   - Then close gently: wish them luck, and remind them it’s okay if not everything gets done.
-
-STYLE:
-- Calm, grounded, and human.
-- Short paragraphs and simple language.
-- Never guilt-trip or judge the user.
-- If they didn’t follow through on past goals, respond with curiosity, not blame:
-  - "No worries, that happens. Do you want to keep that goal or adjust it for today?"
-
-Remember: your primary job is to be a short, supportive check-in, not a therapist, coach, or productivity drill sergeant.
-""",
+Use your tools to load content and switch modes as needed.
+"""
         )
+        self.current_mode = "learn"
+        self.concepts = self._load_concepts()
+        logger.info(f"Loaded {len(self.concepts)} concepts")
 
-    @function_tool()
-    async def get_wellness_history(
-        self,
-        context: RunContext,
-        limit: int = 3,
-    ) -> List[Dict[str, Any]]:
-        """
-        Return up to `limit` most recent wellness check-ins.
-
-        Each entry has this shape:
-        {
-          "timestamp": ISO-8601 string,
-          "mood": str,
-          "energy": int,
-          "stressors": str or null,
-          "objectives": [str, ...],
-          "agent_summary": str
-        }
-        """
-        entries = _read_wellness_log()
-        if limit <= 0:
+    def _load_concepts(self):
+        """Load concepts on initialization"""
+        try:
+            logger.info(f"Looking for course content at: {COURSE_CONTENT_FILE}")
+            
+            if os.path.exists(COURSE_CONTENT_FILE):
+                with open(COURSE_CONTENT_FILE, 'r', encoding='utf-8') as f:
+                    content = json.load(f)
+                logger.info(f"Successfully loaded {len(content)} concepts")
+                return content
+            else:
+                logger.error(f"File not found: {COURSE_CONTENT_FILE}")
+                # Try relative path as fallback
+                relative_path = "./shared_data/day4_tutor_content.json"
+                if os.path.exists(relative_path):
+                    with open(relative_path, 'r', encoding='utf-8') as f:
+                        content = json.load(f)
+                    logger.info(f"Loaded from relative path: {len(content)} concepts")
+                    return content
+                return []
+        except Exception as e:
+            logger.error(f"Error loading concepts: {e}")
             return []
 
-        # newest first
-        entries_sorted = sorted(
-            entries,
-            key=lambda e: e.get("timestamp", ""),
-            reverse=True,
-        )
-        recent = entries_sorted[:limit]
-
-        # store last history in session if you ever want it
-        context.session.userdata["recent_wellness_history"] = recent
-        return recent
+    @function_tool()
+    async def load_course_content(self, context: RunContext) -> str:
+        """Load and display available course concepts."""
+        if not self.concepts:
+            return "No course content available. Please check the content file."
+        
+        concept_list = []
+        for concept in self.concepts:
+            concept_list.append(f"• {concept.get('title')} ({concept.get('id')})")
+        
+        return "Available concepts:\n" + "\n".join(concept_list)
 
     @function_tool()
-    async def log_wellness_check(
-        self,
-        context: RunContext,
-        mood: str,
-        energy: int,
-        stressors: Optional[str],
-        objectives: List[str],
-        agent_summary: str,
-    ) -> str:
-        """
-        Append a new wellness check-in entry to wellness_log.json.
-        """
-        logger.info(f"[log_wellness_check] called with mood={mood}, energy={energy}, "
-                    f"stressors={stressors}, objectives={objectives}")
-
-        # basic safety for input
-        try:
-            energy_int = int(energy)
-        except Exception:
-            energy_int = 0
-
-        if not isinstance(objectives, list):
-            objectives = [str(objectives)]
-
-        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-        entry: Dict[str, Any] = {
-            "timestamp": timestamp,
-            "mood": mood,
-            "energy": energy_int,
-            "stressors": stressors,
-            "objectives": objectives,
-            "agent_summary": agent_summary,
+    async def switch_mode(self, context: RunContext, new_mode: str) -> str:
+        """Switch between learning modes: learn, quiz, or teach_back."""
+        valid_modes = ["learn", "quiz", "teach_back"]
+        if new_mode.lower() not in valid_modes:
+            return f"Invalid mode. Please choose from: {', '.join(valid_modes)}"
+        
+        old_mode = self.current_mode
+        self.current_mode = new_mode.lower()
+        
+        mode_descriptions = {
+            "learn": "Learn mode - I'll explain concepts (Voice: Matthew)",
+            "quiz": "Quiz mode - I'll ask you questions (Voice: Alicia)", 
+            "teach_back": "Teach-back mode - You explain concepts to me (Voice: Ken)"
         }
+        
+        return f"Switched to {mode_descriptions[self.current_mode]}"
 
-        entries = _read_wellness_log()
-        entries.append(entry)
-        _write_wellness_log(entries)
+    @function_tool()
+    async def explain_concept(self, context: RunContext, concept_name: str = None) -> str:
+        """Explain a concept in learn mode."""
+        if not self.concepts:
+            return "No concepts available to explain."
+        
+        concept = None
+        if concept_name:
+            # Find concept by ID or title
+            for c in self.concepts:
+                if c.get('id') == concept_name.lower() or c.get('title').lower() == concept_name.lower():
+                    concept = c
+                    break
+        
+        if not concept:
+            # Use first concept as default
+            concept = self.concepts[0]
+        
+        return f"Let me explain {concept.get('title')}:\n\n{concept.get('summary')}"
 
-        context.session.userdata["last_wellness_entry"] = entry
+    @function_tool()
+    async def quiz_concept(self, context: RunContext, concept_name: str = None) -> str:
+        """Quiz a concept in quiz mode."""
+        if not self.concepts:
+            return "No concepts available for quiz."
+        
+        concept = None
+        if concept_name:
+            for c in self.concepts:
+                if c.get('id') == concept_name.lower() or c.get('title').lower() == concept_name.lower():
+                    concept = c
+                    break
+        
+        if not concept:
+            concept = self.concepts[0]
+        
+        return f"Quiz question about {concept.get('title')}:\n\n{concept.get('sample_question')}"
 
-        logger.info(f"[log_wellness_check] wrote entry to {WELLNESS_LOG_PATH}")
-        return f"Logged wellness check for {timestamp} with {len(objectives)} objectives."
-
+    @function_tool()
+    async def teach_back_concept(self, context: RunContext, concept_name: str = None) -> str:
+        """Ask user to explain a concept back in teach-back mode."""
+        if not self.concepts:
+            return "No concepts available for teach-back."
+        
+        concept = None
+        if concept_name:
+            for c in self.concepts:
+                if c.get('id') == concept_name.lower() or c.get('title').lower() == concept_name.lower():
+                    concept = c
+                    break
+        
+        if not concept:
+            concept = self.concepts[0]
+        
+        return f"Now it's your turn to teach me about {concept.get('title')}! Please explain this concept in your own words."
 
 
 def prewarm(proc: JobProcess):
@@ -252,28 +172,28 @@ def prewarm(proc: JobProcess):
 
 
 async def entrypoint(ctx: JobContext):
-    # Logging setup
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
 
+    # Initialize the agent
+    agent = ActiveRecallCoach()
+    
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
-        llm=google.LLM(
-            model="gemini-2.5-flash",
-        ),
+        llm=google.LLM(model="gemini-2.5-flash"),
         tts=murf.TTS(
             voice="en-US-matthew",
             style="Conversation",
             tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-            text_pacing=True,
+            text_pacing=True
         ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
     )
-    session.userdata = {}
 
+    # Metrics collection
     usage_collector = metrics.UsageCollector()
 
     @session.on("metrics_collected")
@@ -287,8 +207,9 @@ async def entrypoint(ctx: JobContext):
 
     ctx.add_shutdown_callback(log_usage)
 
+    # Start the session
     await session.start(
-        agent=Assistant(),
+        agent=agent,
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
