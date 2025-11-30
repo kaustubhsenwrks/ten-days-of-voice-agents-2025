@@ -1,0 +1,30 @@
+[
+  {
+    "id": "45b986ef-2293-4adb-84a1-19a4912e2e0d",
+    "created_at": "2025-11-30T09:42:38.958891Z",
+    "status": "CONFIRMED",
+    "items": [
+      {
+        "product_id": "tshirt-001",
+        "name": "Cotton Crew Neck T-Shirt",
+        "quantity": 1,
+        "unit_price": 450,
+        "currency": "INR",
+        "item_total": 450
+      },
+      {
+        "product_id": "hoodie-002",
+        "name": "Sport Tech Hoodie",
+        "quantity": 1,
+        "unit_price": 1800,
+        "currency": "INR",
+        "item_total": 1800
+      }
+    ],
+    "total": 2250,
+    "currency": "INR",
+    "buyer": {
+      "name": "Voice Customer"
+    }
+  }
+]
