@@ -3,7 +3,7 @@ import { Room, RoomEvent, TokenSource } from 'livekit-client';
 import { AppConfig } from '@/app-config';
 import { toastAlert } from '@/components/livekit/alert-toast';
 
-export function useRoom(appConfig: AppConfig) {
+export function useRoom(appConfig: AppConfig, playerName?: string) {   // ⭐ NEW ARG
   const aborted = useRef(false);
   const room = useMemo(() => new Room(), []);
   const [isSessionActive, setIsSessionActive] = useState(false);
@@ -36,6 +36,7 @@ export function useRoom(appConfig: AppConfig) {
     };
   }, [room]);
 
+  // Token fetcher
   const tokenSource = useMemo(
     () =>
       TokenSource.custom(async () => {
@@ -68,29 +69,31 @@ export function useRoom(appConfig: AppConfig) {
     [appConfig]
   );
 
+  // ⭐ MAIN MODIFICATION
   const startSession = useCallback(() => {
     setIsSessionActive(true);
 
     if (room.state === 'disconnected') {
       const { isPreConnectBufferEnabled } = appConfig;
+
       Promise.all([
         room.localParticipant.setMicrophoneEnabled(true, undefined, {
           preConnectBuffer: isPreConnectBufferEnabled,
         }),
+
         tokenSource
           .fetch({ agentName: appConfig.agentName })
           .then((connectionDetails) =>
-            room.connect(connectionDetails.serverUrl, connectionDetails.participantToken)
+            room.connect(
+              connectionDetails.serverUrl,
+              connectionDetails.participantToken,
+              {
+                metadata: JSON.stringify({ playerName: playerName ?? "Player" }),   // ⭐ SEND NAME
+              }
+            )
           ),
       ]).catch((error) => {
-        if (aborted.current) {
-          // Once the effect has cleaned up after itself, drop any errors
-          //
-          // These errors are likely caused by this effect rerunning rapidly,
-          // resulting in a previous run `disconnect` running in parallel with
-          // a current run `connect`
-          return;
-        }
+        if (aborted.current) return;
 
         toastAlert({
           title: 'There was an error connecting to the agent',
@@ -98,7 +101,7 @@ export function useRoom(appConfig: AppConfig) {
         });
       });
     }
-  }, [room, appConfig, tokenSource]);
+  }, [room, appConfig, tokenSource, playerName]);   // ⭐ include playerName
 
   const endSession = useCallback(() => {
     setIsSessionActive(false);
