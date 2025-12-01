@@ -1,3 +1,4 @@
+# agent.py (fixed)
 import logging
 import json
 import random
@@ -8,6 +9,7 @@ from typing import Dict, Any, List, Optional
 from pathlib import Path
 from datetime import datetime
 import uuid
+import time
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -311,67 +313,159 @@ def prewarm(proc: JobProcess):
         # Don't raise, continue without VAD if necessary
 
 
-async def entrypoint(ctx: JobContext):
-    """Entry point for the Improv Battle agent."""
-    ctx.log_context_fields = {
-        "room": ctx.room.name,
-    }
+# --- DEBUG PATCH START ---
+# Add a tiny helper to log and flush immediately:
+def loud(msg):
+    logger.info(msg)
+    # also print to console for immediate visibility (uv run may pipe differently)
+    print(msg, flush=True)
 
-    logger.info(f"Starting Improv Battle agent in room: {ctx.room.name}")
+
+# Replace your entrypoint with this debug-heavy one:
+async def entrypoint(ctx: JobContext):
+    """Debug entrypoint: loud logs, participant handlers, heartbeat."""
+    ctx.log_context_fields = {"room": ctx.room.name}
+    loud(f"ENTRYPOINT STARTED for room: {ctx.room.name} | pid={os.getpid()}")
+
+    # show room metadata safely (sid may be coroutine)
+    try:
+        room_name = getattr(ctx.room, "name", None)
+        sid_val = getattr(ctx.room, "sid", None)
+        sid_repr = "<coroutine>" if asyncio.iscoroutine(sid_val) else sid_val
+        loud(f"Room metadata: name={room_name} id={sid_repr}")
+    except Exception:
+        loud("Could not read ctx.room metadata")
 
     try:
+        loud("Attempting ctx.connect() now...")
+        await ctx.connect()
+        loud("ctx.connect() completed ✅")
+    except Exception as e:
+        logger.exception("ctx.connect() failed")
+        loud(f"ctx.connect() exception: {e}")
+        raise
+
+    # Register simple room event hooks (best-effort; if API differs they will harmlessly fail)
+    try:
+        if hasattr(ctx.room, "on"):
+            def _on_participant_joined(ev):
+                # sync wrapper - spawn async task for heavy work if needed
+                asyncio.create_task(_handle_participant_joined(ev))
+
+            async def _handle_participant_joined(ev):
+                loud(f"PARTICIPANT JOINED event: {ev}")
+
+            def _on_participant_left(ev):
+                asyncio.create_task(_handle_participant_left(ev))
+
+            async def _handle_participant_left(ev):
+                loud(f"PARTICIPANT LEFT event: {ev}")
+
+            try:
+                ctx.room.on("participant_joined", _on_participant_joined)
+                ctx.room.on("participant_left", _on_participant_left)
+                loud("Registered room participant_joined/left handlers")
+            except Exception:
+                loud("Room .on exists but handlers couldn't be registered (ok)")
+        else:
+            loud("ctx.room has no .on hook - skipping participant listeners")
+    except Exception:
+        loud("Error while attempting to register room event hooks")
+        logger.exception("room event hook registration failed")
+
+    # Build session but don't swallow exceptions
+    try:
+        loud("Constructing AgentSession (STT/LLM/TTS) -- check credentials now...")
         agent = ImprovBattleAgent()
 
-        # Get VAD from prewarm or create new
         vad_instance = ctx.proc.userdata.get("vad")
         if not vad_instance:
-            logger.warning("VAD not pre-warmed, loading now...")
-            vad_instance = silero.VAD.load()
+            try:
+                loud("Loading VAD (silero) for debug...")
+                vad_instance = silero.VAD.load()
+                loud("VAD loaded")
+            except Exception as e:
+                loud(f"VAD load failed: {e} (continuing without VAD)")
+                vad_instance = None
 
         session = AgentSession(
             stt=deepgram.STT(model="nova-3"),
             llm=google.LLM(model="gemini-2.5-flash"),
             tts=murf.TTS(
-                voice="en-US-matthew",  # or any Murf Falcon voice you like
+                voice="en-US-matthew",
                 style="Conversation",
                 tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
                 text_pacing=True,
             ),
             turn_detection=MultilingualModel(),
             vad=vad_instance,
-            preemptive_generation=True,
+            preemptive_generation=False,
         )
 
-        usage_collector = metrics.UsageCollector()
+        # --- Register sync wrappers for session events (LiveKit requires sync callbacks) ---
+        def _on_started(ev):
+            asyncio.create_task(_handle_started(ev))
 
-        @session.on("metrics_collected")
-        def _on_metrics_collected(ev: MetricsCollectedEvent):
-            metrics.log_metrics(ev.metrics)
-            usage_collector.collect(ev.metrics)
+        async def _handle_started(ev):
+            loud("SESSION.started fired ✅")
 
-        async def log_usage():
+        def _on_stopped(ev):
+            asyncio.create_task(_handle_stopped(ev))
+
+        async def _handle_stopped(ev):
+            loud("SESSION.stopped fired")
+
+        def make_logger(name):
+            def _handler(ev):
+                asyncio.create_task(async_log_event(name, ev))
+            return _handler
+
+        async def async_log_event(name, ev):
             try:
-                summary = usage_collector.get_summary()
-                logger.info(f"Usage: {summary}")
+                loud(f"EVENT {name}: {repr(ev)[:500]}")
             except Exception as e:
-                logger.error(f"Error logging usage: {e}")
+                loud(f"Error logging event {name}: {e}")
 
-        ctx.add_shutdown_callback(log_usage)
+        # Attach the handlers via the API that accepts (event, handler)
+        try:
+            session.on("started", _on_started)
+            session.on("stopped", _on_stopped)
+        except Exception:
+            # If the API only supports decorator style, fall back to attribute register pattern
+            try:
+                session.on("started")(_on_started)  # will be sync
+            except Exception:
+                pass
 
-        await session.start(
-            agent=agent,
-            room=ctx.room,
-            room_input_options=RoomInputOptions(
-                noise_cancellation=noise_cancellation.BVC(),
-            ),
-        )
+        # best-effort for content events
+        try:
+            session.on("user_turn", make_logger("user_turn"))
+            session.on("user_speech", make_logger("user_speech"))
+            session.on("transcript", make_logger("transcript"))
+            loud("Attached session user_turn/user_speech/transcript handlers (best-effort)")
+        except Exception:
+            loud("Couldn't attach some session handlers (ok)")
 
-        await ctx.connect()
-
+        loud("Calling session.start() now...")
+        start_ts = time.time()
+        await session.start(agent=agent, room=ctx.room, room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()))
+        loud(f"session.start() returned in {time.time() - start_ts:.2f}s -- session should be active")
     except Exception as e:
-        logger.error(f"Error in entrypoint: {e}")
+        logger.exception("session.start or setup failed")
+        loud(f"session.start/setup exception: {e}")
         raise
 
+    # heartbeat so you see process alive and waiting for participants
+    async def heartbeat():
+        while True:
+            loud(f"HEARTBEAT: agent alive, rounds={agent.improv_state.get('current_round')}, phase={agent.improv_state.get('phase')}")
+            await asyncio.sleep(10)
+
+    # spawn heartbeat but don't block (fire-and-forget)
+    asyncio.create_task(heartbeat())
+
+    loud("Entrypoint finished setup; agent should now respond when participants publish audio.")
+# --- DEBUG PATCH END ---
 
 if __name__ == "__main__":
     # Set up logging
@@ -380,7 +474,7 @@ if __name__ == "__main__":
         format='%(asctime)s %(levelname)-8s %(name)-12s %(message)s',
         datefmt='%H:%M:%S'
     )
-    
+
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,

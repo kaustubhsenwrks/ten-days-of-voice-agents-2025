@@ -1,9 +1,10 @@
+// src/hooks/useRoom.ts
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Room, RoomEvent, TokenSource } from 'livekit-client';
 import { AppConfig } from '@/app-config';
 import { toastAlert } from '@/components/livekit/alert-toast';
 
-export function useRoom(appConfig: AppConfig, playerName?: string) {   // ⭐ NEW ARG
+export function useRoom(appConfig: AppConfig, playerName?: string) {
   const aborted = useRef(false);
   const room = useMemo(() => new Room(), []);
   const [isSessionActive, setIsSessionActive] = useState(false);
@@ -32,17 +33,42 @@ export function useRoom(appConfig: AppConfig, playerName?: string) {   // ⭐ NE
   useEffect(() => {
     return () => {
       aborted.current = true;
-      room.disconnect();
+      try {
+        room.disconnect();
+      } catch {
+        /* ignore */
+      }
     };
   }, [room]);
 
-  // Token fetcher
+  // DEV: expose room to window for debugging (remove after debugging)
+  useEffect(() => {
+    if (room && typeof window !== 'undefined') {
+      try {
+        (window as any).room = room;
+        // Make this obvious in console while debugging
+        // eslint-disable-next-line no-console
+        console.log('DEBUG: LiveKit room attached to window.room');
+      } catch {
+        /* ignore */
+      }
+    }
+    return () => {
+      try {
+        if ((window as any).room === room) {
+          delete (window as any).room;
+        }
+      } catch {}
+    };
+  }, [room]);
+
+  // Token source
   const tokenSource = useMemo(
     () =>
       TokenSource.custom(async () => {
         const url = new URL(
           process.env.NEXT_PUBLIC_CONN_DETAILS_ENDPOINT ?? '/api/connection-details',
-          window.location.origin
+          typeof window !== 'undefined' ? window.location.origin : 'http://localhost'
         );
 
         try {
@@ -62,6 +88,7 @@ export function useRoom(appConfig: AppConfig, playerName?: string) {   // ⭐ NE
           });
           return await res.json();
         } catch (error) {
+          // eslint-disable-next-line no-console
           console.error('Error fetching connection details:', error);
           throw new Error('Error fetching connection details!');
         }
@@ -69,7 +96,6 @@ export function useRoom(appConfig: AppConfig, playerName?: string) {   // ⭐ NE
     [appConfig]
   );
 
-  // ⭐ MAIN MODIFICATION
   const startSession = useCallback(() => {
     setIsSessionActive(true);
 
@@ -83,29 +109,34 @@ export function useRoom(appConfig: AppConfig, playerName?: string) {   // ⭐ NE
 
         tokenSource
           .fetch({ agentName: appConfig.agentName })
-          .then((connectionDetails) =>
-            room.connect(
-              connectionDetails.serverUrl,
-              connectionDetails.participantToken,
-              {
-                metadata: JSON.stringify({ playerName: playerName ?? "Player" }),   // ⭐ SEND NAME
-              }
-            )
-          ),
+          .then(async (connectionDetails) => {
+            // connect first (some livekit-client builds disallow metadata arg in connect)
+            await room.connect(connectionDetails.serverUrl, connectionDetails.participantToken);
+
+            // then set metadata — fail-soft
+            try {
+              await room.localParticipant.setMetadata(JSON.stringify({ playerName: playerName ?? 'Player' }));
+            } catch (err) {
+              // ignore metadata set errors
+            }
+          }),
       ]).catch((error) => {
         if (aborted.current) return;
 
         toastAlert({
           title: 'There was an error connecting to the agent',
-          description: `${error.name}: ${error.message}`,
+          description: `${(error as Error).name}: ${(error as Error).message}`,
         });
       });
     }
-  }, [room, appConfig, tokenSource, playerName]);   // ⭐ include playerName
+  }, [room, appConfig, tokenSource, playerName]);
 
   const endSession = useCallback(() => {
     setIsSessionActive(false);
-  }, []);
+    try {
+      room.disconnect();
+    } catch {}
+  }, [room]);
 
   return { room, isSessionActive, startSession, endSession };
 }

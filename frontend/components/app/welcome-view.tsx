@@ -1,3 +1,4 @@
+// src/welcome-view.tsx
 "use client";
 
 import { useState } from "react";
@@ -5,7 +6,7 @@ import { useState } from "react";
 type WelcomeViewProps = {
   startSession: () => void;
   setPlayerName: (name: string) => void;
-  isConnecting: boolean;   // ⭐ FIXED NAME
+  isConnecting: boolean;
 };
 
 export function WelcomeView({
@@ -19,7 +20,7 @@ export function WelcomeView({
     e.preventDefault();
     if (!name.trim() || isConnecting) return;
 
-    setPlayerName(name.trim());  
+    setPlayerName(name.trim());
     startSession();
   };
 
